@@ -1,0 +1,103 @@
+---
+- name: azure
+  hosts: localhost
+  connection: local
+  gather_facts: False
+  vars:
+    - awkator: '{print> ("disks/{{ subscription_id }}-" NR ".txt")}'
+    - sedator: 's/\"//g;s/\://g;s/\]//g;s/\[{//g'
+    - separator: 'zone'
+    - source_disk: 'Standard_LRS'
+    - target_disk: 'Premium_LRS'
+    - resource_group: 'RG'
+    - subscription_id: 'Some'
+  tasks:
+  - name: Azure Account connect
+    azure_rm_manageddisk_info:
+      auth_source: cli
+      subscription_id: "{{ subscription_id }}"
+    register: result
+    tags: deploy
+  
+  - name: "Create directory if not exists"
+    file:
+     path: disks
+     state: directory
+     mode: 0755
+     group: root
+     owner: root 
+    ignore_errors: true 
+    tags: deploy
+  
+  - name: clean files
+    shell: "rm disks/*.txt"
+    ignore_errors: true
+    tags: deploy
+  
+  - name: "Create file if not exists"
+    file:
+     path: "disks/{{ subscription_id }}-0.txt"
+     state: touch
+    tags: deploy
+
+  - name: Create File
+    local_action: copy content={{ result.ansible_info.azure_managed_disk }} dest=file.txt
+    tags: deploy
+
+  - name: Create {{ subscription_id }}-1.txt files
+    shell: "grep -Eio '[^,]+' file.txt|sed '{{ sedator }}'|awk -v RS='{{ separator }}' '{{ awkator }}'" 
+    tags: deploy
+
+  - name: search {{ source_disk }} in {{ subscription_id }}-1.txt files
+    shell: "grep '{{ source_disk }}' disks/{{ subscription_id }}-*.txt|cut -d: -f 1" 
+    register: files_tochange
+    tags: deploy
+
+  - debug:
+     msg: "{{ files_tochange.stdout_lines }}"
+     tags: deploy
+
+  - name: list resources subscription_id "{{ subscription_id }} {{ item.name }}"
+    shell: "grep -Eio '[^,]+' {{ item }}|grep -e 'name'|awk '{print $2}'|cut -d ',' -f 1" 
+    register: disk_tomove
+    with_items: "{{ files_tochange.stdout_lines }}"
+    tags: deploy
+
+  - debug:
+     msg: "{{ item.stdout }}"
+    with_items: "{{ disk_tomove.results }}"
+    loop_control: 
+      label: "{{ item.item }}"
+    tags: deploy
+
+  - name: Search to Detach
+    shell: "grep -Eio '[^,]+' {{ item }}|grep -e 'managed_by'| awk -F'/' '{print $NF}'" 
+    register: to_shutdown
+    with_items: "{{ files_tochange.stdout_lines }}"
+    tags: shutdown
+
+  - name: Detach VM
+    shell: 'az vm deallocate --resource-group {{ resource_group }} --name {{ item.stdout }}'
+    with_items: "{{ to_shutdown.results }}"
+    tags: shutdown
+    
+  - pause:
+      seconds: 10
+    tags: shutdown
+
+  - name: Changing {{ resource_group }} disk {{ source_disk }} to {{ target_disk }}
+    shell: 'az disk update -n {{ item.stdout }} -g {{ resource_group }} --sku {{ target_disk }}' 
+    with_items: "{{ disk_tomove.results }}"
+    tags: deploy
+  
+  - name: Resizing disk to {{ resize_to }}
+    shell: 'az disk update -n {{ item.stdout }} -g {{ resource_group }} -z {{ resize_to }}'
+    with_items: "{{ disk_tomove.results }}"
+    tags: resize
+  
+  - name: Start VM
+    shell: 'az vm start --resource-group {{ resource_group }} --name {{ item.stdout }}'
+    with_items: "{{ to_shutdown.results }}"
+    tags: start
+    
+  
